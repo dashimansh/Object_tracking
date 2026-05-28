@@ -1,0 +1,1289 @@
+// 
+
+================================================================
+  COMPLETE OBJECT TRACKER â€” ALL FILES
+  C++ + OpenCV 4.9 â€” Production Ready
+================================================================
+
+FOLDER STRUCTURE:
+C:\ObjectTracker\
+â”œâ”€â”€ CMakeLists.txt
+â”œâ”€â”€ Config.h
+â”œâ”€â”€ KalmanTracker.h
+â”œâ”€â”€ KalmanTracker.cpp
+â”œâ”€â”€ Detector.h
+â”œâ”€â”€ Detector.cpp
+â”œâ”€â”€ Tracker.h
+â”œâ”€â”€ Tracker.cpp
+â”œâ”€â”€ FrameStabilizer.h
+â”œâ”€â”€ FrameStabilizer.cpp
+â”œâ”€â”€ ThreadedCamera.h
+â”œâ”€â”€ ThreadedCamera.cpp
+â””â”€â”€ main.cpp
+
+================================================================
+FILE 1 â€” CMakeLists.txt
+================================================================
+
+cmake_minimum_required(VERSION 3.10)
+project(ObjectTracker)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_BUILD_TYPE Release)
+
+set(OpenCV_DIR "C:/opencv/build")
+find_package(OpenCV REQUIRED)
+
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+add_executable(ObjectTracker
+    main.cpp
+    KalmanTracker.cpp
+    Detector.cpp
+    Tracker.cpp
+    FrameStabilizer.cpp
+    ThreadedCamera.cpp
+)
+
+target_link_libraries(ObjectTracker
+    ${OpenCV_LIBS}
+)
+
+if(WIN32)
+    add_custom_command(TARGET ObjectTracker
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+        -E copy_if_different
+        "C:/opencv/build/x64/vc16/bin/opencv_world490.dll"
+        $<TARGET_FILE_DIR:ObjectTracker>)
+endif()
+
+
+================================================================
+FILE 2 â€” Config.h
+================================================================
+
+#pragma once
+
+// Camera
+#define CAMERA_SOURCE       0
+#define CAMERA_WIDTH        640
+#define CAMERA_HEIGHT       360
+#define CAMERA_FPS          60
+#define CAMERA_BUFFER_SIZE  1
+
+// Detection
+#define DETECTION_INTERVAL  30
+#define MIN_OBJECT_AREA     500
+#define SEARCH_PADDING      60
+
+// Tracking
+#define MAX_LOST_FRAMES     45
+#define MAX_JUMP_DISTANCE   150.f
+
+// RED color ranges (HSV)
+// Red wraps around in HSV â€” needs 2 ranges
+#define RED_LOWER1_H  0
+#define RED_LOWER1_S  120
+#define RED_LOWER1_V  70
+#define RED_UPPER1_H  10
+#define RED_UPPER1_S  255
+#define RED_UPPER1_V  255
+
+#define RED_LOWER2_H  170
+#define RED_LOWER2_S  120
+#define RED_LOWER2_V  70
+#define RED_UPPER2_H  180
+#define RED_UPPER2_S  255
+#define RED_UPPER2_V  255
+
+// Display
+#define WINDOW_NAME      "Object Tracker"
+#define SHOW_DEBUG_INFO   true
+#define SHOW_KALMAN_PRED  true
+
+
+================================================================
+FILE 3 â€” KalmanTracker.h
+================================================================
+
+#pragma once
+#include <opencv2/opencv.hpp>
+
+class KalmanTracker
+{
+public:
+    KalmanTracker();
+
+    void     Init(const cv::Rect& InitBox);
+    cv::Rect Update(const cv::Rect& Measured);
+    cv::Rect Predict();
+    void     Reset();
+
+    cv::Rect GetPredictedBox() const
+    { return PredictedBox; }
+
+    bool IsInitialized() const
+    { return bInitialized; }
+
+private:
+    cv::KalmanFilter KF;
+    cv::Mat          Measurement;
+    cv::Rect         PredictedBox;
+    bool             bInitialized = false;
+
+    cv::Rect MatToRect(const cv::Mat& State);
+};
+
+
+================================================================
+FILE 4 â€” KalmanTracker.cpp
+================================================================
+
+#include "KalmanTracker.h"
+
+KalmanTracker::KalmanTracker()
+{
+    KF          = cv::KalmanFilter(6, 4, 0);
+    Measurement = cv::Mat::zeros(4, 1, CV_32F);
+}
+
+void KalmanTracker::Init(const cv::Rect& InitBox)
+{
+    KF.transitionMatrix =
+        (cv::Mat_<float>(6, 6) <<
+        1,0,0,0,1,0,
+        0,1,0,0,0,1,
+        0,0,1,0,0,0,
+        0,0,0,1,0,0,
+        0,0,0,0,1,0,
+        0,0,0,0,0,1);
+
+    cv::setIdentity(KF.measurementMatrix);
+    cv::setIdentity(KF.processNoiseCov,
+        cv::Scalar::all(1e-4));
+    cv::setIdentity(KF.measurementNoiseCov,
+        cv::Scalar::all(1e-2));
+    cv::setIdentity(KF.errorCovPost,
+        cv::Scalar::all(1));
+
+    KF.statePost.at<float>(0) = (float)InitBox.x;
+    KF.statePost.at<float>(1) = (float)InitBox.y;
+    KF.statePost.at<float>(2) = (float)InitBox.width;
+    KF.statePost.at<float>(3) = (float)InitBox.height;
+    KF.statePost.at<float>(4) = 0;
+    KF.statePost.at<float>(5) = 0;
+
+    PredictedBox = InitBox;
+    bInitialized = true;
+}
+
+cv::Rect KalmanTracker::Update(
+    const cv::Rect& Measured)
+{
+    if (!bInitialized)
+    {
+        Init(Measured);
+        return Measured;
+    }
+
+    KF.predict();
+
+    Measurement.at<float>(0) = (float)Measured.x;
+    Measurement.at<float>(1) = (float)Measured.y;
+    Measurement.at<float>(2) = (float)Measured.width;
+    Measurement.at<float>(3) = (float)Measured.height;
+
+    cv::Mat Corrected = KF.correct(Measurement);
+    PredictedBox = MatToRect(Corrected);
+    return PredictedBox;
+}
+
+cv::Rect KalmanTracker::Predict()
+{
+    if (!bInitialized) return cv::Rect();
+    cv::Mat Pred = KF.predict();
+    PredictedBox = MatToRect(Pred);
+    return PredictedBox;
+}
+
+void KalmanTracker::Reset()
+{
+    bInitialized = false;
+    PredictedBox = cv::Rect();
+}
+
+cv::Rect KalmanTracker::MatToRect(
+    const cv::Mat& S)
+{
+    int X = std::max(0, (int)S.at<float>(0));
+    int Y = std::max(0, (int)S.at<float>(1));
+    int W = std::max(1, (int)S.at<float>(2));
+    int H = std::max(1, (int)S.at<float>(3));
+    return cv::Rect(X, Y, W, H);
+}
+
+
+================================================================
+FILE 5 â€” Detector.h
+================================================================
+
+#pragma once
+#include <opencv2/opencv.hpp>
+
+struct DetectionResult
+{
+    bool      bFound     = false;
+    cv::Rect  BoundingBox;
+    cv::Point Center;
+    double    Area       = 0.0;
+    float     Confidence = 0.f;
+};
+
+class Detector
+{
+public:
+    Detector();
+
+    DetectionResult Detect(const cv::Mat& Frame);
+
+    cv::Rect SelectROI(cv::Mat& Frame);
+
+    void SetColorRange(
+        const cv::Scalar& Lower1,
+        const cv::Scalar& Upper1,
+        const cv::Scalar& Lower2 = cv::Scalar(-1,-1,-1),
+        const cv::Scalar& Upper2 = cv::Scalar(-1,-1,-1));
+
+    void AdaptColorRange(
+        const cv::Mat& Frame,
+        const cv::Rect& ObjectBox);
+
+    void Draw(cv::Mat& Frame,
+        const DetectionResult& Result);
+
+    cv::Mat GetMask() const { return Mask; }
+
+private:
+    cv::Scalar ColorLower1;
+    cv::Scalar ColorUpper1;
+    cv::Scalar ColorLower2;
+    cv::Scalar ColorUpper2;
+    bool       bHasTwoRanges = false;
+    float      AdaptRate     = 0.05f;
+
+    cv::Mat HSVFrame;
+    cv::Mat Mask;
+    cv::Mat Mask2;
+
+    void            BuildMask(const cv::Mat& Frame);
+    DetectionResult FindLargestBlob();
+};
+
+
+================================================================
+FILE 6 â€” Detector.cpp
+================================================================
+
+#include "Detector.h"
+#include "Config.h"
+#include <iostream>
+
+Detector::Detector()
+{
+    ColorLower1 = cv::Scalar(
+        RED_LOWER1_H, RED_LOWER1_S, RED_LOWER1_V);
+    ColorUpper1 = cv::Scalar(
+        RED_UPPER1_H, RED_UPPER1_S, RED_UPPER1_V);
+    ColorLower2 = cv::Scalar(
+        RED_LOWER2_H, RED_LOWER2_S, RED_LOWER2_V);
+    ColorUpper2 = cv::Scalar(
+        RED_UPPER2_H, RED_UPPER2_S, RED_UPPER2_V);
+    bHasTwoRanges = true;
+}
+
+void Detector::SetColorRange(
+    const cv::Scalar& Lower1,
+    const cv::Scalar& Upper1,
+    const cv::Scalar& Lower2,
+    const cv::Scalar& Upper2)
+{
+    ColorLower1 = Lower1;
+    ColorUpper1 = Upper1;
+    if (Lower2[0] >= 0)
+    {
+        ColorLower2   = Lower2;
+        ColorUpper2   = Upper2;
+        bHasTwoRanges = true;
+    }
+    else bHasTwoRanges = false;
+}
+
+void Detector::BuildMask(const cv::Mat& Frame)
+{
+    cv::cvtColor(Frame, HSVFrame,
+        cv::COLOR_BGR2HSV);
+    cv::inRange(HSVFrame,
+        ColorLower1, ColorUpper1, Mask);
+    if (bHasTwoRanges)
+    {
+        cv::inRange(HSVFrame,
+            ColorLower2, ColorUpper2, Mask2);
+        cv::bitwise_or(Mask, Mask2, Mask);
+    }
+    cv::erode(Mask, Mask,
+        cv::Mat(), cv::Point(-1,-1), 2);
+    cv::dilate(Mask, Mask,
+        cv::Mat(), cv::Point(-1,-1), 3);
+}
+
+DetectionResult Detector::FindLargestBlob()
+{
+    DetectionResult Result;
+    std::vector<std::vector<cv::Point>> Contours;
+    cv::findContours(Mask, Contours,
+        cv::RETR_EXTERNAL,
+        cv::CHAIN_APPROX_SIMPLE);
+
+    if (Contours.empty()) return Result;
+
+    double LargestArea = 0;
+    int    LargestIdx  = -1;
+    for (int i = 0; i < (int)Contours.size(); i++)
+    {
+        double Area = cv::contourArea(Contours[i]);
+        if (Area > LargestArea)
+        {
+            LargestArea = Area;
+            LargestIdx  = i;
+        }
+    }
+
+    if (LargestArea < MIN_OBJECT_AREA)
+        return Result;
+
+    Result.bFound      = true;
+    Result.Area        = LargestArea;
+    Result.BoundingBox = cv::boundingRect(
+        Contours[LargestIdx]);
+    Result.Center = cv::Point(
+        Result.BoundingBox.x +
+            Result.BoundingBox.width  / 2,
+        Result.BoundingBox.y +
+            Result.BoundingBox.height / 2);
+
+    float BoxArea = (float)(
+        Result.BoundingBox.width *
+        Result.BoundingBox.height);
+    Result.Confidence = std::min(1.f,
+        (float)(LargestArea / BoxArea));
+    return Result;
+}
+
+DetectionResult Detector::Detect(
+    const cv::Mat& Frame)
+{
+    if (Frame.empty()) return DetectionResult();
+    BuildMask(Frame);
+    return FindLargestBlob();
+}
+
+void Detector::AdaptColorRange(
+    const cv::Mat& Frame,
+    const cv::Rect& ObjectBox)
+{
+    cv::Rect SafeBox = ObjectBox &
+        cv::Rect(0, 0, Frame.cols, Frame.rows);
+    if (SafeBox.area() <= 0) return;
+
+    cv::Mat ObjectHSV;
+    cv::cvtColor(Frame(SafeBox),
+        ObjectHSV, cv::COLOR_BGR2HSV);
+
+    cv::Scalar Mean, StdDev;
+    cv::meanStdDev(ObjectHSV, Mean, StdDev);
+
+    float Margin = 15.f;
+    cv::Scalar NewLower(
+        std::max(0.0,   Mean[0] - Margin),
+        std::max(0.0,   Mean[1] - 40.0),
+        std::max(0.0,   Mean[2] - 40.0));
+    cv::Scalar NewUpper(
+        std::min(180.0, Mean[0] + Margin),
+        255.0, 255.0);
+
+    for (int i = 0; i < 3; i++)
+    {
+        ColorLower1[i] =
+            ColorLower1[i] * (1 - AdaptRate) +
+            NewLower[i]    * AdaptRate;
+        ColorUpper1[i] =
+            ColorUpper1[i] * (1 - AdaptRate) +
+            NewUpper[i]    * AdaptRate;
+    }
+    bHasTwoRanges = false;
+}
+
+cv::Rect Detector::SelectROI(cv::Mat& Frame)
+{
+    cv::Rect ROI = cv::selectROI(
+        "Select Object â€” press Enter",
+        Frame, false, false);
+    cv::destroyWindow(
+        "Select Object â€” press Enter");
+    return ROI;
+}
+
+void Detector::Draw(
+    cv::Mat& Frame,
+    const DetectionResult& Result)
+{
+    if (!Result.bFound) return;
+    cv::rectangle(Frame, Result.BoundingBox,
+        cv::Scalar(0, 165, 255), 2);
+    cv::putText(Frame,
+        "DETECTED " + std::to_string(
+            (int)(Result.Confidence * 100)) + "%",
+        cv::Point(Result.BoundingBox.x,
+            Result.BoundingBox.y - 8),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55, cv::Scalar(0, 165, 255), 2);
+}
+
+
+================================================================
+FILE 7 â€” FrameStabilizer.h
+================================================================
+
+#pragma once
+#include <opencv2/opencv.hpp>
+
+class FrameStabilizer
+{
+public:
+    FrameStabilizer();
+
+    cv::Mat  Stabilize(const cv::Mat& Frame);
+    cv::Rect TransformBox(
+        const cv::Rect& Box, int W, int H);
+    void Reset();
+    bool IsReady() const { return bReady; }
+
+private:
+    cv::Mat PrevGray;
+    cv::Mat Transform;
+    bool    bReady = false;
+
+    std::vector<cv::Point2f> PrevPoints;
+    std::vector<cv::Point2f> CurrPoints;
+    std::vector<cv::Mat>     History;
+    int HistorySize = 5;
+
+    cv::Mat GetSmoothed();
+};
+
+
+================================================================
+FILE 8 â€” FrameStabilizer.cpp
+================================================================
+
+#include "FrameStabilizer.h"
+
+FrameStabilizer::FrameStabilizer()
+{
+    History.reserve(HistorySize);
+}
+
+cv::Mat FrameStabilizer::Stabilize(
+    const cv::Mat& Frame)
+{
+    cv::Mat Gray;
+    cv::cvtColor(Frame, Gray, cv::COLOR_BGR2GRAY);
+
+    if (!bReady)
+    {
+        PrevGray  = Gray.clone();
+        bReady    = true;
+        Transform = cv::Mat::eye(2, 3, CV_64F);
+        return Frame.clone();
+    }
+
+    cv::goodFeaturesToTrack(
+        PrevGray, PrevPoints, 200, 0.01, 30);
+
+    if (PrevPoints.empty())
+    {
+        PrevGray = Gray.clone();
+        return Frame.clone();
+    }
+
+    std::vector<uchar> Status;
+    std::vector<float> Error;
+    cv::calcOpticalFlowPyrLK(
+        PrevGray, Gray,
+        PrevPoints, CurrPoints,
+        Status, Error);
+
+    std::vector<cv::Point2f> GP, GC;
+    for (size_t i = 0; i < Status.size(); i++)
+    {
+        if (Status[i])
+        {
+            GP.push_back(PrevPoints[i]);
+            GC.push_back(CurrPoints[i]);
+        }
+    }
+
+    if (GP.size() < 4)
+    {
+        PrevGray = Gray.clone();
+        return Frame.clone();
+    }
+
+    cv::Mat T = cv::estimateAffinePartial2D(GP, GC);
+    if (T.empty())
+    {
+        PrevGray = Gray.clone();
+        return Frame.clone();
+    }
+
+    History.push_back(T.clone());
+    if ((int)History.size() > HistorySize)
+        History.erase(History.begin());
+
+    Transform = GetSmoothed();
+
+    cv::Mat Inv = Transform.clone();
+    Inv.at<double>(0, 2) = -Inv.at<double>(0, 2);
+    Inv.at<double>(1, 2) = -Inv.at<double>(1, 2);
+
+    cv::Mat Stabilized;
+    cv::warpAffine(Frame, Stabilized,
+        Inv, Frame.size());
+
+    PrevGray = Gray.clone();
+    return Stabilized;
+}
+
+cv::Mat FrameStabilizer::GetSmoothed()
+{
+    if (History.empty())
+        return cv::Mat::eye(2, 3, CV_64F);
+    cv::Mat Sum = cv::Mat::zeros(2, 3, CV_64F);
+    for (auto& T : History) Sum += T;
+    return Sum / (double)History.size();
+}
+
+cv::Rect FrameStabilizer::TransformBox(
+    const cv::Rect& Box, int W, int H)
+{
+    if (Transform.empty()) return Box;
+    std::vector<cv::Point2f> Corners = {
+        {(float)Box.x,            (float)Box.y},
+        {(float)(Box.x+Box.width),(float)Box.y},
+        {(float)Box.x,            (float)(Box.y+Box.height)},
+        {(float)(Box.x+Box.width),(float)(Box.y+Box.height)}
+    };
+    std::vector<cv::Point2f> Trans;
+    cv::transform(Corners, Trans, Transform);
+
+    float MinX = Trans[0].x, MinY = Trans[0].y;
+    float MaxX = Trans[0].x, MaxY = Trans[0].y;
+    for (auto& P : Trans)
+    {
+        MinX = std::min(MinX, P.x);
+        MinY = std::min(MinY, P.y);
+        MaxX = std::max(MaxX, P.x);
+        MaxY = std::max(MaxY, P.y);
+    }
+    cv::Rect R(
+        (int)MinX, (int)MinY,
+        (int)(MaxX - MinX),
+        (int)(MaxY - MinY));
+    R &= cv::Rect(0, 0, W, H);
+    return R;
+}
+
+void FrameStabilizer::Reset()
+{
+    bReady = false;
+    PrevGray.release();
+    History.clear();
+    Transform = cv::Mat::eye(2, 3, CV_64F);
+}
+
+
+================================================================
+FILE 9 â€” ThreadedCamera.h
+================================================================
+
+#pragma once
+#include <opencv2/opencv.hpp>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
+class ThreadedCamera
+{
+public:
+    ThreadedCamera();
+    ~ThreadedCamera();
+
+    bool Open(int DeviceID = 0);
+    bool OpenFile(const std::string& Path);
+    bool GetLatestFrame(cv::Mat& Out);
+    void Stop();
+
+    bool IsRunning() const
+    { return bRunning.load(); }
+    int GetWidth()  const { return Width;  }
+    int GetHeight() const { return Height; }
+    int GetFPS()    const { return FPS;    }
+
+private:
+    cv::VideoCapture  Cap;
+    cv::Mat           LatestFrame;
+    std::mutex        FrameMutex;
+    std::thread       CamThread;
+    std::atomic<bool> bRunning { false };
+    std::atomic<bool> bNewFrame{ false };
+    int Width = 0, Height = 0, FPS = 0;
+
+    void CaptureLoop();
+    void SetupCamera();
+};
+
+
+================================================================
+FILE 10 â€” ThreadedCamera.cpp
+================================================================
+
+#include "ThreadedCamera.h"
+#include "Config.h"
+#include <iostream>
+
+ThreadedCamera::ThreadedCamera() {}
+ThreadedCamera::~ThreadedCamera() { Stop(); }
+
+bool ThreadedCamera::Open(int ID)
+{
+    Cap.open(ID);
+    if (!Cap.isOpened())
+    {
+        std::cerr << "Cannot open camera\n";
+        return false;
+    }
+    SetupCamera();
+    return true;
+}
+
+bool ThreadedCamera::OpenFile(
+    const std::string& Path)
+{
+    Cap.open(Path);
+    if (!Cap.isOpened()) return false;
+    Width  = (int)Cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    Height = (int)Cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    FPS    = (int)Cap.get(cv::CAP_PROP_FPS);
+    bRunning  = true;
+    CamThread = std::thread(
+        &ThreadedCamera::CaptureLoop, this);
+    return true;
+}
+
+void ThreadedCamera::SetupCamera()
+{
+    Cap.set(cv::CAP_PROP_BUFFERSIZE,
+        CAMERA_BUFFER_SIZE);
+    Cap.set(cv::CAP_PROP_FRAME_WIDTH,
+        CAMERA_WIDTH);
+    Cap.set(cv::CAP_PROP_FRAME_HEIGHT,
+        CAMERA_HEIGHT);
+    Cap.set(cv::CAP_PROP_FPS,
+        CAMERA_FPS);
+
+    Width  = (int)Cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    Height = (int)Cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    FPS    = (int)Cap.get(cv::CAP_PROP_FPS);
+
+    std::cout << "Camera: "
+        << Width << "x" << Height
+        << " @ " << FPS << "fps\n";
+
+    bRunning  = true;
+    CamThread = std::thread(
+        &ThreadedCamera::CaptureLoop, this);
+}
+
+void ThreadedCamera::CaptureLoop()
+{
+    while (bRunning)
+    {
+        cv::Mat Frame;
+        Cap >> Frame;
+        if (Frame.empty())
+        {
+            Cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+            continue;
+        }
+        std::lock_guard<std::mutex>
+            Lock(FrameMutex);
+        LatestFrame = Frame.clone();
+        bNewFrame   = true;
+    }
+}
+
+bool ThreadedCamera::GetLatestFrame(
+    cv::Mat& Out)
+{
+    if (!bNewFrame) return false;
+    std::lock_guard<std::mutex>
+        Lock(FrameMutex);
+    Out       = LatestFrame.clone();
+    bNewFrame = false;
+    return true;
+}
+
+void ThreadedCamera::Stop()
+{
+    bRunning = false;
+    if (CamThread.joinable())
+        CamThread.join();
+    Cap.release();
+}
+
+
+================================================================
+FILE 11 â€” Tracker.h
+================================================================
+
+#pragma once
+#include <opencv2/opencv.hpp>
+#include <opencv2/tracking.hpp>
+#include "KalmanTracker.h"
+
+enum class ETrackerType
+{
+    CSRT,
+    KCF,
+    MOSSE
+};
+
+enum class ETrackState
+{
+    Idle,
+    Tracking,
+    Occluded,
+    Lost
+};
+
+class ObjectTracker
+{
+public:
+    ObjectTracker();
+
+    bool     Init(const cv::Mat& Frame,
+                  const cv::Rect& BBox,
+                  ETrackerType Type =
+                      ETrackerType::CSRT);
+    cv::Rect Update(const cv::Mat& Frame);
+    bool     Reinit(const cv::Mat& Frame,
+                    const cv::Rect& NewBBox);
+    void     Reset();
+    void     Draw(cv::Mat& Frame);
+
+    ETrackState GetState()       const
+    { return State; }
+    cv::Rect    GetCurrentBox()  const
+    { return CurrentBox; }
+    cv::Rect    GetPredictedBox() const
+    { return KFilter.GetPredictedBox(); }
+    int         GetLostCount()   const
+    { return LostFrameCount; }
+    bool IsTracking() const
+    { return State == ETrackState::Tracking; }
+    bool IsOccluded() const
+    { return State == ETrackState::Occluded; }
+    bool IsLost() const
+    { return State == ETrackState::Lost; }
+
+private:
+    cv::Ptr<cv::Tracker> CVTracker;
+    KalmanTracker        KFilter;
+    ETrackState          State;
+    ETrackerType         TrackerType;
+    cv::Rect             CurrentBox;
+    int                  LostFrameCount = 0;
+
+    void CreateCVTracker();
+};
+
+
+================================================================
+FILE 12 â€” Tracker.cpp
+================================================================
+
+#include "Tracker.h"
+#include "Config.h"
+#include <iostream>
+
+ObjectTracker::ObjectTracker()
+{
+    State          = ETrackState::Idle;
+    LostFrameCount = 0;
+}
+
+void ObjectTracker::CreateCVTracker()
+{
+    switch (TrackerType)
+    {
+    case ETrackerType::CSRT:
+        CVTracker = cv::TrackerCSRT::create();
+        std::cout << "CSRT tracker\n";
+        break;
+    case ETrackerType::KCF:
+        CVTracker = cv::TrackerKCF::create();
+        std::cout << "KCF tracker\n";
+        break;
+    case ETrackerType::MOSSE:
+        CVTracker =
+            cv::legacy::TrackerMOSSE::create();
+        std::cout << "MOSSE tracker\n";
+        break;
+    }
+}
+
+bool ObjectTracker::Init(
+    const cv::Mat& Frame,
+    const cv::Rect& BBox,
+    ETrackerType Type)
+{
+    TrackerType = Type;
+    CreateCVTracker();
+
+    cv::Rect SafeBox = BBox &
+        cv::Rect(0, 0, Frame.cols, Frame.rows);
+    if (SafeBox.area() <= 0) return false;
+
+    CVTracker->init(Frame, SafeBox);
+    KFilter.Init(SafeBox);
+
+    CurrentBox     = SafeBox;
+    State          = ETrackState::Tracking;
+    LostFrameCount = 0;
+    return true;
+}
+
+cv::Rect ObjectTracker::Update(
+    const cv::Mat& Frame)
+{
+    if (State == ETrackState::Idle)
+        return cv::Rect();
+
+    cv::Rect TrackerBox;
+    bool bOK = CVTracker->update(
+        Frame, TrackerBox);
+
+    if (bOK)
+    {
+        cv::Point LastC(
+            CurrentBox.x + CurrentBox.width  / 2,
+            CurrentBox.y + CurrentBox.height / 2);
+        cv::Point NewC(
+            TrackerBox.x + TrackerBox.width  / 2,
+            TrackerBox.y + TrackerBox.height / 2);
+        float Dist = (float)cv::norm(LastC - NewC);
+        if (Dist > MAX_JUMP_DISTANCE)
+            bOK = false;
+    }
+
+    if (bOK)
+    {
+        CurrentBox     = KFilter.Update(TrackerBox);
+        State          = ETrackState::Tracking;
+        LostFrameCount = 0;
+    }
+    else
+    {
+        LostFrameCount++;
+        if (LostFrameCount <= MAX_LOST_FRAMES)
+        {
+            CurrentBox = KFilter.Predict();
+            State      = ETrackState::Occluded;
+        }
+        else
+        {
+            State = ETrackState::Lost;
+            std::cout << "Object LOST\n";
+        }
+    }
+    return CurrentBox;
+}
+
+bool ObjectTracker::Reinit(
+    const cv::Mat& Frame,
+    const cv::Rect& NewBBox)
+{
+    CreateCVTracker();
+    cv::Rect SafeBox = NewBBox &
+        cv::Rect(0, 0, Frame.cols, Frame.rows);
+    if (SafeBox.area() <= 0) return false;
+
+    CVTracker->init(Frame, SafeBox);
+    KFilter.Update(SafeBox);
+
+    CurrentBox     = SafeBox;
+    State          = ETrackState::Tracking;
+    LostFrameCount = 0;
+    std::cout << "Tracker reinitialized\n";
+    return true;
+}
+
+void ObjectTracker::Reset()
+{
+    CVTracker.release();
+    KFilter.Reset();
+    State          = ETrackState::Idle;
+    LostFrameCount = 0;
+    CurrentBox     = cv::Rect();
+}
+
+void ObjectTracker::Draw(cv::Mat& Frame)
+{
+    if (State == ETrackState::Idle) return;
+
+    cv::Scalar  Color;
+    std::string Text;
+
+    switch (State)
+    {
+    case ETrackState::Tracking:
+        Color = cv::Scalar(0, 255, 0);
+        Text  = "TRACKING";
+        break;
+    case ETrackState::Occluded:
+        Color = cv::Scalar(0, 165, 255);
+        Text  = "OCCLUDED";
+        break;
+    case ETrackState::Lost:
+        Color = cv::Scalar(0, 0, 255);
+        Text  = "LOST";
+        break;
+    default: return;
+    }
+
+    cv::rectangle(Frame, CurrentBox, Color, 2);
+
+    if (SHOW_KALMAN_PRED &&
+        State == ETrackState::Occluded)
+    {
+        cv::Rect P = KFilter.GetPredictedBox();
+        cv::rectangle(Frame, P,
+            cv::Scalar(255, 255, 0), 1);
+        cv::putText(Frame, "KALMAN",
+            cv::Point(P.x, P.y - 5),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.4, cv::Scalar(255, 255, 0), 1);
+    }
+
+    cv::Point C(
+        CurrentBox.x + CurrentBox.width  / 2,
+        CurrentBox.y + CurrentBox.height / 2);
+    cv::line(Frame,
+        {C.x-15,C.y}, {C.x+15,C.y}, Color, 2);
+    cv::line(Frame,
+        {C.x,C.y-15}, {C.x,C.y+15}, Color, 2);
+
+    cv::putText(Frame, Text,
+        cv::Point(CurrentBox.x,
+            CurrentBox.y - 10),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.6, Color, 2);
+}
+
+
+================================================================
+FILE 13 â€” main.cpp
+================================================================
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <chrono>
+#include "Config.h"
+#include "Detector.h"
+#include "Tracker.h"
+#include "FrameStabilizer.h"
+#include "ThreadedCamera.h"
+
+class FPSCounter
+{
+public:
+    void Tick()
+    {
+        auto N = std::chrono::steady_clock::now();
+        double E = std::chrono::duration<double>(
+            N - Last).count();
+        Last = N;
+        FPS  = 1.0 / E;
+    }
+    double Get() const { return FPS; }
+private:
+    std::chrono::steady_clock::time_point
+        Last = std::chrono::steady_clock::now();
+    double FPS = 0.0;
+};
+
+void DrawHUD(
+    cv::Mat& Frame,
+    double   FPS,
+    ETrackState State,
+    int      Lost)
+{
+    cv::rectangle(Frame,
+        cv::Rect(0, 0, Frame.cols, 75),
+        cv::Scalar(0, 0, 0), -1);
+
+    cv::putText(Frame,
+        "FPS: " + std::to_string((int)FPS),
+        {10, 24},
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7, cv::Scalar(0, 255, 255), 2);
+
+    std::string S;
+    cv::Scalar  SC;
+    switch (State)
+    {
+    case ETrackState::Idle:
+        S  = "IDLE";
+        SC = cv::Scalar(200, 200, 200);
+        break;
+    case ETrackState::Tracking:
+        S  = "TRACKING";
+        SC = cv::Scalar(0, 255, 0);
+        break;
+    case ETrackState::Occluded:
+        S  = "OCCLUDED [" +
+             std::to_string(Lost) + "/" +
+             std::to_string(MAX_LOST_FRAMES) + "]";
+        SC = cv::Scalar(0, 165, 255);
+        break;
+    case ETrackState::Lost:
+        S  = "LOST â€” press D to redetect";
+        SC = cv::Scalar(0, 0, 255);
+        break;
+    }
+
+    cv::putText(Frame, "STATE: " + S,
+        {160, 24},
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65, SC, 2);
+
+    cv::putText(Frame,
+        "S=Select  D=AutoDetect  R=Reset  "
+        "T=Stabilize  1=CSRT 2=KCF 3=MOSSE  Q=Quit",
+        {10, 55},
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.45, cv::Scalar(180, 180, 180), 1);
+}
+
+int main()
+{
+    std::cout
+        << "Object Tracker â€” Production\n"
+        << "============================\n"
+        << "S = Select manually\n"
+        << "D = Auto detect red object\n"
+        << "R = Reset\n"
+        << "T = Toggle stabilization\n"
+        << "1 = CSRT  2 = KCF  3 = MOSSE\n"
+        << "Q = Quit\n\n";
+
+    ThreadedCamera  Camera;
+    Detector        Det;
+    ObjectTracker   Tracker;
+    FrameStabilizer Stab;
+    FPSCounter      FPS;
+
+    if (!Camera.Open(CAMERA_SOURCE))
+    {
+        std::cerr << "Camera failed\n";
+        return -1;
+    }
+
+    cv::Mat Frame;
+    int     FrameCount = 0;
+    bool    bStabilize = false;
+
+    cv::namedWindow(WINDOW_NAME,
+        cv::WINDOW_NORMAL);
+    cv::resizeWindow(WINDOW_NAME, 960, 540);
+
+    while (true)
+    {
+        if (!Camera.GetLatestFrame(Frame))
+            continue;
+
+        FrameCount++;
+        FPS.Tick();
+
+        cv::Mat PF = Frame.clone();
+        if (bStabilize)
+            PF = Stab.Stabilize(Frame);
+
+        if (FrameCount % DETECTION_INTERVAL == 0
+            && Tracker.IsTracking())
+        {
+            DetectionResult DR = Det.Detect(PF);
+            if (DR.bFound)
+                Det.AdaptColorRange(
+                    PF, DR.BoundingBox);
+        }
+
+        if (Tracker.IsLost() ||
+           (Tracker.IsOccluded() &&
+            Tracker.GetLostCount() >
+            MAX_LOST_FRAMES / 2))
+        {
+            DetectionResult DR = Det.Detect(PF);
+            if (DR.bFound)
+            {
+                cv::Rect Pred =
+                    Tracker.GetPredictedBox();
+                cv::Point PC(
+                    Pred.x + Pred.width  / 2,
+                    Pred.y + Pred.height / 2);
+                float D = (float)cv::norm(
+                    PC - DR.Center);
+
+                if (D < MAX_JUMP_DISTANCE
+                    || Tracker.IsLost())
+                {
+                    Tracker.Reinit(
+                        PF, DR.BoundingBox);
+                    std::cout << "Recovered!\n";
+                }
+            }
+        }
+
+        if (Tracker.GetState() !=
+            ETrackState::Idle)
+            Tracker.Update(PF);
+
+        Tracker.Draw(PF);
+        DrawHUD(PF, FPS.Get(),
+            Tracker.GetState(),
+            Tracker.GetLostCount());
+
+        cv::imshow(WINDOW_NAME, PF);
+
+        char Key = (char)cv::waitKey(1);
+
+        if (Key == 's' || Key == 'S')
+        {
+            cv::Rect ROI = Det.SelectROI(PF);
+            if (ROI.width > 0 && ROI.height > 0)
+                Tracker.Init(PF, ROI,
+                    ETrackerType::CSRT);
+        }
+        else if (Key == 'd' || Key == 'D')
+        {
+            DetectionResult DR = Det.Detect(PF);
+            if (DR.bFound)
+                Tracker.Init(PF,
+                    DR.BoundingBox,
+                    ETrackerType::CSRT);
+            else
+                std::cout
+                    << "Red object not found\n";
+        }
+        else if (Key == 'r' || Key == 'R')
+        {
+            Tracker.Reset();
+            Stab.Reset();
+            std::cout << "Reset\n";
+        }
+        else if (Key == 't' || Key == 'T')
+        {
+            bStabilize = !bStabilize;
+            std::cout << "Stabilize: "
+                << (bStabilize ? "ON" : "OFF")
+                << "\n";
+        }
+        else if (Key == '1')
+        {
+            if (Tracker.GetState() !=
+                ETrackState::Idle)
+                Tracker.Init(PF,
+                    Tracker.GetCurrentBox(),
+                    ETrackerType::CSRT);
+        }
+        else if (Key == '2')
+        {
+            if (Tracker.GetState() !=
+                ETrackState::Idle)
+                Tracker.Init(PF,
+                    Tracker.GetCurrentBox(),
+                    ETrackerType::KCF);
+        }
+        else if (Key == '3')
+        {
+            if (Tracker.GetState() !=
+                ETrackState::Idle)
+                Tracker.Init(PF,
+                    Tracker.GetCurrentBox(),
+                    ETrackerType::MOSSE);
+        }
+        else if (Key == 'q' || Key == 'Q'
+            || Key == 27)
+            break;
+    }
+
+    Camera.Stop();
+    cv::destroyAllWindows();
+    return 0;
+}
+
+
+================================================================
+BUILD STEPS
+================================================================
+
+1. Create folder:  C:\ObjectTracker\
+2. Create each file listed above
+3. Open CMake GUI
+   Source â†’ C:\ObjectTracker
+   Build  â†’ C:\ObjectTracker\build
+   Click Configure
+   Select: Visual Studio 17 2022
+   Click Generate
+4. Open build\ObjectTracker.sln
+5. Change Debug â†’ Release
+6. Build â†’ Build Solution
+7. Run
+
+================================================================
+CONTROLS
+================================================================
+
+S  = Select object with mouse
+D  = Auto detect red object
+R  = Reset everything
+T  = Toggle camera stabilization
+1  = Switch to CSRT (most accurate)
+2  = Switch to KCF  (fast)
+3  = Switch to MOSSE (fastest)
+Q  = Quit
+
+================================================================
+REAL WORLD PROBLEMS SOLVED
+================================================================
+
+Occlusion      â†’ Kalman predicts 45 frames
+Scale change   â†’ CSRT handles automatically
+Lighting       â†’ AdaptColorRange every 30 frames
+Camera shake   â†’ FrameStabilizer
+Low latency    â†’ ThreadedCamera + 640x360
+Wrong track    â†’ MAX_JUMP_DISTANCE check
+Object lost    â†’ Color redetection fallback
+
+================================================================
